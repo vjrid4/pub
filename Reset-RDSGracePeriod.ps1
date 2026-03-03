@@ -62,7 +62,7 @@ public class RegHelper
     [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Auto)]
     static extern int SetSecurityInfo(IntPtr h, uint t, uint si, byte[] own, byte[] grp, IntPtr dacl, IntPtr sacl);
 
-    [StructLayout(LayoutKind.Sequential)]
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
     public struct TP { public uint Count; public long Luid; public uint Attr; }
 
     public static int EnablePriv(string priv)
