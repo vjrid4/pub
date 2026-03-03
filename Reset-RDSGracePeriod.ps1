@@ -1,6 +1,6 @@
 # Reset-RDSGracePeriod.ps1
 # Resets the RDS 120-day grace period by deleting the TimeBomb registry value.
-# Run this from an elevated (Administrator) PowerShell prompt:
+# Run from an elevated (Administrator) PowerShell prompt:
 #   Set-ExecutionPolicy Bypass -Scope Process -Force
 #   .\Reset-RDSGracePeriod.ps1
 
@@ -13,17 +13,15 @@ Write-Host "=====================================================" -ForegroundCo
 Write-Host ""
 Write-Host "Current user: $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)" -ForegroundColor Gray
 
-# --- Paths ---
 $workerPath = "$env:TEMP\RDSGraceWorker.ps1"
 $logPath    = "$env:TEMP\RDSGraceWorker.log"
 
 Remove-Item $logPath -Force -ErrorAction SilentlyContinue
 Remove-Item $workerPath -Force -ErrorAction SilentlyContinue
 
-# --- Worker script: runs as SYSTEM, writes its own log file ---
-# SYSTEM has implicit full access to most registry keys, so we skip
-# the problematic AdjustTokenPrivileges entirely and go straight to
-# RegOpenKeyEx with WRITE_OWNER | WRITE_DAC | KEY_ALL_ACCESS.
+# --- Worker script: runs as SYSTEM ---
+# Does EVERYTHING via Win32 API: open key, take ownership, set ACL, enum values, delete values.
+# Never uses .NET OpenSubKey which can silently open read-only.
 
 $workerScript = @"
 `$ErrorActionPreference = 'Stop'
@@ -37,46 +35,56 @@ try {
     Log "=== RDS Grace Period Worker ==="
     Log "Running as: `$([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)"
     Log "Timestamp: `$(Get-Date)"
+    Log "64-bit process: `$([Environment]::Is64BitProcess)"
     Log ""
 
     `$regKeyPath = "SYSTEM\CurrentControlSet\Control\Terminal Server\RCM\GracePeriod"
 
-    # --- Load P/Invoke (no struct needed - avoids alignment issues) ---
     `$code = @'
 using System;
+using System.Text;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+
 public class RegHelper
 {
     [DllImport("advapi32.dll", SetLastError = true)]
     static extern bool OpenProcessToken(IntPtr h, uint acc, out IntPtr t);
-    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     static extern bool LookupPrivilegeValue(string sys, string name, out long luid);
     [DllImport("advapi32.dll", SetLastError = true)]
     static extern bool AdjustTokenPrivileges(IntPtr t, bool d, IntPtr newState, uint b, IntPtr p, IntPtr r);
     [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
     [DllImport("kernel32.dll")] static extern void SetLastError(uint e);
-    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     static extern int RegOpenKeyEx(IntPtr hk, string sub, uint opt, uint sam, out IntPtr res);
     [DllImport("advapi32.dll", SetLastError = true)]
     static extern int RegCloseKey(IntPtr hk);
-    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-    static extern int SetSecurityInfo(IntPtr h, uint t, uint si, byte[] own, byte[] grp, IntPtr dacl, IntPtr sacl);
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern int RegDeleteValue(IntPtr hk, string valueName);
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern int RegEnumValue(IntPtr hk, uint index, StringBuilder name, ref uint nameLen,
+        IntPtr reserved, IntPtr type, IntPtr data, IntPtr dataLen);
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern int SetSecurityInfo(IntPtr h, uint objType, uint secInfo,
+        byte[] owner, byte[] group, IntPtr dacl, IntPtr sacl);
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern int SetNamedSecurityInfo(string objectName, uint objType, uint secInfo,
+        byte[] owner, byte[] group, IntPtr dacl, IntPtr sacl);
 
-    // Manually marshal TOKEN_PRIVILEGES as raw bytes to avoid struct alignment bugs
+    static readonly IntPtr HKLM = new IntPtr(unchecked((int)0x80000002));
+
     public static int EnablePriv(string priv)
     {
         IntPtr tok;
-        if (!OpenProcessToken(GetCurrentProcess(), 0x0020 | 0x0008, out tok)) return -1;
+        if (!OpenProcessToken(GetCurrentProcess(), 0x0028, out tok)) return -1;
         long luid;
         if (!LookupPrivilegeValue(null, priv, out luid)) return -2;
 
-        // TOKEN_PRIVILEGES layout: Count(4 bytes) + LUID(8 bytes) + Attributes(4 bytes) = 16 bytes
         byte[] tp = new byte[16];
-        // PrivilegeCount = 1
         BitConverter.GetBytes((uint)1).CopyTo(tp, 0);
-        // LUID at offset 4
         BitConverter.GetBytes(luid).CopyTo(tp, 4);
-        // SE_PRIVILEGE_ENABLED = 2 at offset 12
         BitConverter.GetBytes((uint)2).CopyTo(tp, 12);
 
         IntPtr tpPtr = Marshal.AllocHGlobal(16);
@@ -91,40 +99,61 @@ public class RegHelper
         return err;
     }
 
-    static readonly IntPtr HKLM = new IntPtr(unchecked((int)0x80000002));
-
-    public static int TakeOwn(string path, byte[] sid)
+    // Take ownership using SetNamedSecurityInfo (no handle needed)
+    public static int TakeOwnership(string fullKeyPath, byte[] ownerSid)
     {
-        // WRITE_OWNER = 0x80000
+        // SE_REGISTRY_KEY = 4, OWNER_SECURITY_INFORMATION = 1
+        return SetNamedSecurityInfo(fullKeyPath, 4, 1, ownerSid, null, IntPtr.Zero, IntPtr.Zero);
+    }
+
+    // Open key, enumerate all value names, close key
+    public static string[] EnumValues(string subKeyPath, out int error)
+    {
         IntPtr hk;
-        int e = RegOpenKeyEx(HKLM, path, 0, 0x00080000, out hk);
+        // KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS = 0x0019
+        error = RegOpenKeyEx(HKLM, subKeyPath, 0, 0x20019, out hk);
+        if (error != 0) return new string[0];
+
+        var names = new System.Collections.Generic.List<string>();
+        uint index = 0;
+        while (true)
+        {
+            StringBuilder name = new StringBuilder(1024);
+            uint nameLen = 1024;
+            int r = RegEnumValue(hk, index, name, ref nameLen, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+            if (r != 0) break; // ERROR_NO_MORE_ITEMS = 259
+            names.Add(name.ToString());
+            index++;
+        }
+        RegCloseKey(hk);
+        error = 0;
+        return names.ToArray();
+    }
+
+    // Open key with full access and delete a value
+    public static int DeleteValue(string subKeyPath, string valueName)
+    {
+        IntPtr hk;
+        // KEY_ALL_ACCESS = 0xF003F
+        int e = RegOpenKeyEx(HKLM, subKeyPath, 0, 0xF003F, out hk);
         if (e != 0) return 10000 + e;
-        e = SetSecurityInfo(hk, 4, 1, sid, null, IntPtr.Zero, IntPtr.Zero);
+        e = RegDeleteValue(hk, valueName);
         RegCloseKey(hk);
         if (e != 0) return 20000 + e;
         return 0;
     }
 
-    public static int SetDacl(string path, byte[] sid)
+    // Open with KEY_SET_VALUE and delete
+    public static int DeleteValueWrite(string subKeyPath, string valueName)
     {
-        // WRITE_DAC = 0x40000
         IntPtr hk;
-        int e = RegOpenKeyEx(HKLM, path, 0, 0x00040000, out hk);
+        // KEY_SET_VALUE = 0x0002
+        int e = RegOpenKeyEx(HKLM, subKeyPath, 0, 0x0002, out hk);
         if (e != 0) return 30000 + e;
-        // DACL_SECURITY_INFORMATION = 4
-        e = SetSecurityInfo(hk, 4, 4, null, null, IntPtr.Zero, IntPtr.Zero);
+        e = RegDeleteValue(hk, valueName);
         RegCloseKey(hk);
-        // We don't fail on DACL reset - we'll set ACL via .NET after
+        if (e != 0) return 40000 + e;
         return 0;
-    }
-
-    public static int OpenFull(string path)
-    {
-        // KEY_ALL_ACCESS = 0xF003F
-        IntPtr hk;
-        int e = RegOpenKeyEx(HKLM, path, 0, 0xF003F, out hk);
-        if (e == 0) RegCloseKey(hk);
-        return e;
     }
 }
 '@
@@ -134,47 +163,30 @@ public class RegHelper
     }
     Log "OK: P/Invoke loaded"
 
-    # --- Step 1: Enable privileges using raw byte marshaling ---
+    # --- Step 1: Enable ALL useful privileges ---
     Log "Step 1: Enabling privileges..."
-    `$r = [RegHelper]::EnablePriv("SeTakeOwnershipPrivilege")
-    Log "  SeTakeOwnershipPrivilege result: `$r"
-    if (`$r -ne 0) {
-        Log "  WARNING: Could not enable SeTakeOwnershipPrivilege (error `$r)"
-        Log "  Continuing anyway - SYSTEM may have implicit access..."
-    } else {
-        Log "  OK: SeTakeOwnershipPrivilege enabled"
+    foreach (`$priv in @("SeTakeOwnershipPrivilege", "SeRestorePrivilege", "SeBackupPrivilege", "SeSecurityPrivilege")) {
+        `$r = [RegHelper]::EnablePriv(`$priv)
+        Log "  `$priv = `$r (0=OK)"
     }
 
-    `$r2 = [RegHelper]::EnablePriv("SeRestorePrivilege")
-    Log "  SeRestorePrivilege result: `$r2"
-
-    # --- Step 2: Take ownership ---
+    # --- Step 2: Take ownership using SetNamedSecurityInfo ---
+    # This uses the registry path format MACHINE\path instead of a handle
     Log ""
     Log "Step 2: Taking ownership..."
+
     `$sid = New-Object System.Security.Principal.SecurityIdentifier(
         [System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, `$null)
-    `$bytes = New-Object byte[] `$sid.BinaryLength
-    `$sid.GetBinaryForm(`$bytes, 0)
+    `$sidBytes = New-Object byte[] `$sid.BinaryLength
+    `$sid.GetBinaryForm(`$sidBytes, 0)
 
-    `$r = [RegHelper]::TakeOwn(`$regKeyPath, `$bytes)
-    if (`$r -ne 0) {
-        Log "  WARNING: TakeOwnership via WRITE_OWNER returned `$r"
-        Log "  Trying direct full access instead..."
+    `$namedPath = "MACHINE\`$regKeyPath"
+    `$r = [RegHelper]::TakeOwnership(`$namedPath, `$sidBytes)
+    Log "  SetNamedSecurityInfo result: `$r (0=OK)"
 
-        # SYSTEM might already have full access - try opening directly
-        `$r3 = [RegHelper]::OpenFull(`$regKeyPath)
-        if (`$r3 -ne 0) {
-            Log "FAIL: Cannot access key at all (TakeOwn=`$r, FullAccess=`$r3)"
-            exit 1
-        }
-        Log "  OK: SYSTEM has direct full access to key"
-    } else {
-        Log "  OK: Ownership set to Administrators"
-    }
-
-    # --- Step 3: Grant Full Control ---
+    # --- Step 3: Set permissions (Administrators + sadmin + SYSTEM) ---
     Log ""
-    Log "Step 3: Granting Full Control..."
+    Log "Step 3: Setting permissions..."
     try {
         `$key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(`$regKeyPath,
             [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
@@ -182,62 +194,82 @@ public class RegHelper
             [System.Security.AccessControl.RegistryRights]::TakeOwnership -bor
             [System.Security.AccessControl.RegistryRights]::ReadKey)
 
-        if (`$null -eq `$key) {
-            Log "  Trying alternate open method..."
-            `$key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(`$regKeyPath, `$true)
+        if (`$null -ne `$key) {
+            `$acl = `$key.GetAccessControl()
+            `$acl.SetOwner(`$sid)
+
+            # Administrators Full Control
+            `$acl.SetAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule(
+                `$sid, "FullControl", "ContainerInherit", "None", "Allow")))
+
+            # SYSTEM Full Control (so SYSTEM doesn't lose access!)
+            `$systemSid = New-Object System.Security.Principal.SecurityIdentifier(
+                [System.Security.Principal.WellKnownSidType]::LocalSystemSid, `$null)
+            `$acl.SetAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule(
+                `$systemSid, "FullControl", "ContainerInherit", "None", "Allow")))
+
+            # sadmin Full Control
+            `$acl.SetAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule(
+                "sadmin", "FullControl", "ContainerInherit", "None", "Allow")))
+
+            `$key.SetAccessControl(`$acl)
+            `$key.Close()
+            Log "  OK: Permissions set (Administrators + SYSTEM + sadmin = FullControl)"
+        } else {
+            Log "  WARNING: Could not open key via .NET for permissions"
         }
-
-        if (`$null -eq `$key) { Log "FAIL: Could not open key"; exit 1 }
-
-        `$acl = `$key.GetAccessControl(
-            [System.Security.AccessControl.AccessControlSections]::All)
-
-        # Set owner first
-        `$acl.SetOwner(`$sid)
-
-        `$rule1 = New-Object System.Security.AccessControl.RegistryAccessRule(
-            `$sid, "FullControl", "ContainerInherit", "None", "Allow")
-        `$acl.SetAccessRule(`$rule1)
-
-        `$rule2 = New-Object System.Security.AccessControl.RegistryAccessRule(
-            "sadmin", "FullControl", "ContainerInherit", "None", "Allow")
-        `$acl.SetAccessRule(`$rule2)
-
-        `$key.SetAccessControl(`$acl)
-        `$key.Close()
-        Log "  OK: Owner set + Full Control granted to Administrators and sadmin"
     } catch {
-        Log "  EXCEPTION in permissions: `$(`$_.Exception.Message)"
-        Log "  Trying to continue with deletion anyway..."
+        Log "  WARNING: .NET permissions failed: `$(`$_.Exception.Message)"
     }
 
-    # --- Step 4: Delete TimeBomb ---
+    # --- Step 4: Enumerate values ---
     Log ""
-    Log "Step 4: Deleting TimeBomb..."
-    `$key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(`$regKeyPath, `$true)
-    if (`$null -eq `$key) { Log "FAIL: Could not open key for write"; exit 1 }
+    Log "Step 4: Enumerating values..."
+    `$enumErr = 0
+    `$values = [RegHelper]::EnumValues(`$regKeyPath, [ref]`$enumErr)
+    Log "  EnumValues result: err=`$enumErr, count=`$(`$values.Count)"
+    foreach (`$v in `$values) { Log "  Found value: '`$v'" }
 
-    `$allValues = `$key.GetValueNames()
-    Log "  Found `$(`$allValues.Count) values in key: `$(`$allValues -join ', ')"
-
+    # --- Step 5: Delete ALL values via Win32 API ---
+    Log ""
+    Log "Step 5: Deleting values via Win32 RegDeleteValue..."
     `$deleted = 0
-    foreach (`$v in `$allValues) {
-        # Delete ALL values except the default
-        if (`$v -ne '') {
-            try {
-                `$key.DeleteValue(`$v)
-                Log "  OK: Deleted value '`$v'"
-                `$deleted++
-            } catch {
-                Log "  WARN: Could not delete '`$v': `$(`$_.Exception.Message)"
-            }
+    foreach (`$v in `$values) {
+        if (`$v -eq '') { continue }  # skip default value
+
+        # Try KEY_ALL_ACCESS first
+        `$r = [RegHelper]::DeleteValue(`$regKeyPath, `$v)
+        if (`$r -ne 0) {
+            Log "  DeleteValue (full) for '`$v' returned `$r, trying KEY_SET_VALUE..."
+            `$r = [RegHelper]::DeleteValueWrite(`$regKeyPath, `$v)
+        }
+        if (`$r -eq 0) {
+            Log "  OK: Deleted '`$v'"
+            `$deleted++
+        } else {
+            Log "  FAIL: Could not delete '`$v' (error `$r)"
         }
     }
-    if (`$deleted -eq 0) { Log "  INFO: No values to delete" }
-    `$key.Close()
+
+    if (`$deleted -eq 0 -and `$values.Count -le 1) {
+        Log "  INFO: No values to delete (key is empty)"
+    }
+
+    # --- Verify deletion ---
+    Log ""
+    Log "Step 6: Verifying..."
+    `$values2 = [RegHelper]::EnumValues(`$regKeyPath, [ref]`$enumErr)
+    Log "  Values remaining: `$(`$values2.Count)"
+    foreach (`$v in `$values2) { Log "  Remaining: '`$v'" }
 
     Log ""
-    Log "SUCCESS: RDS Grace Period has been reset"
+    if (`$deleted -gt 0) {
+        Log "SUCCESS: Deleted `$deleted value(s). RDS Grace Period has been reset."
+    } elseif (`$values.Count -le 1) {
+        Log "SUCCESS: Key was already clean (no TimeBomb values found)."
+    } else {
+        Log "FAIL: Could not delete values. See errors above."
+    }
 } catch {
     Log "EXCEPTION: `$(`$_.Exception.Message)"
     Log "AT: `$(`$_.InvocationInfo.PositionMessage)"
@@ -245,23 +277,21 @@ public class RegHelper
 }
 "@
 
-# Write worker script
 $workerScript | Out-File -FilePath $workerPath -Encoding ASCII -Force
 
 Write-Host "Worker script written to: $workerPath" -ForegroundColor Gray
 Write-Host ""
 
-# --- Create and run scheduled task as SYSTEM ---
 $taskName = "RDSGraceReset_$(Get-Random)"
 
-Write-Host "Creating scheduled task '$taskName' as SYSTEM..." -ForegroundColor Yellow
+Write-Host "Creating scheduled task as SYSTEM..." -ForegroundColor Yellow
 
 $taskCmd = "cmd.exe /c powershell.exe -ExecutionPolicy Bypass -NoProfile -NonInteractive -File `"$workerPath`""
 
 schtasks.exe /Create /TN $taskName /TR $taskCmd /SC ONCE /ST 00:00 /RU SYSTEM /RL HIGHEST /F 2>&1 | ForEach-Object { Write-Host "  schtasks: $_" -ForegroundColor Gray }
 
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "FAILED to create scheduled task. Are you running as Administrator?" -ForegroundColor Red
+    Write-Host "FAILED to create scheduled task." -ForegroundColor Red
     Read-Host "Press Enter to exit"
     exit 1
 }
@@ -270,7 +300,7 @@ Write-Host "Starting task..." -ForegroundColor Yellow
 schtasks.exe /Run /TN $taskName 2>&1 | ForEach-Object { Write-Host "  schtasks: $_" -ForegroundColor Gray }
 
 Write-Host "Waiting for SYSTEM task to complete..." -ForegroundColor Yellow
-$maxWait = 45
+$maxWait = 60
 $waited = 0
 while ($waited -lt $maxWait) {
     Start-Sleep -Seconds 3
@@ -279,17 +309,15 @@ while ($waited -lt $maxWait) {
 
     if (Test-Path $logPath) {
         $content = Get-Content $logPath -Raw -ErrorAction SilentlyContinue
-        if ($content -match "SUCCESS" -or $content -match "FAIL" -or $content -match "EXCEPTION") {
+        if ($content -match "SUCCESS" -or $content -match "FAIL:" -or $content -match "EXCEPTION") {
             Write-Host "  Task completed." -ForegroundColor Green
             break
         }
     }
 }
 
-# Cleanup task
 schtasks.exe /Delete /TN $taskName /F 2>$null | Out-Null
 
-# Show results
 Write-Host ""
 Write-Host "============ SYSTEM Execution Log ============" -ForegroundColor Cyan
 
@@ -318,13 +346,6 @@ if (Test-Path $logPath) {
     }
 } else {
     Write-Host "NO LOG FILE FOUND at: $logPath" -ForegroundColor Red
-    Write-Host ""
-    Write-Host "The scheduled task may not have started. Possible causes:" -ForegroundColor Yellow
-    Write-Host "  - Task Scheduler service not running" -ForegroundColor Gray
-    Write-Host "  - SYSTEM account restricted by policy" -ForegroundColor Gray
-    Write-Host "  - Antivirus blocked the script" -ForegroundColor Gray
-    Write-Host ""
-
     Remove-Item $workerPath -Force -ErrorAction SilentlyContinue
     Read-Host "Press Enter to exit"
 }
