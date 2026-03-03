@@ -3,20 +3,101 @@
 # Resets the RDS 120-day grace period by deleting the TimeBomb registry value.
 # Must be run as Administrator (elevated prompt).
 #
-# Uses raw Win32 API calls (RegOpenKeyEx, SetSecurityInfo) to bypass .NET's
-# OpenSubKey ACL check which blocks access even with SeTakeOwnershipPrivilege.
+# Strategy: Group Policy may strip SeTakeOwnershipPrivilege from admin tokens.
+# SYSTEM always has all privileges, so we auto-elevate to SYSTEM using a
+# scheduled task if the current token lacks the privilege.
 
 Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
 
-# --- Combined P/Invoke class for privilege elevation + registry operations ---
+$regKeyPath = "SYSTEM\CurrentControlSet\Control\Terminal Server\RCM\GracePeriod"
 
+# =============================================================================
+# SYSTEM AUTO-ELEVATION: If not running as SYSTEM, re-launch via scheduled task
+# =============================================================================
+$currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$isSystem = $currentUser.IsSystem
+
+if (-not $isSystem) {
+    Write-Host "Current user: $($currentUser.Name)" -ForegroundColor Cyan
+    Write-Host "Not running as SYSTEM. Elevating via scheduled task..." -ForegroundColor Yellow
+
+    $scriptPath = $MyInvocation.MyCommand.Path
+    if (-not $scriptPath) {
+        # If run via paste or ISE, save to a temp file
+        $scriptPath = Join-Path $env:TEMP "Reset-RDSGracePeriod_temp.ps1"
+        Copy-Item -Path $PSCommandPath -Destination $scriptPath -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path $scriptPath)) {
+            # Last resort: write self to temp
+            $MyInvocation.MyCommand.ScriptBlock.ToString() | Out-File -FilePath $scriptPath -Encoding UTF8 -Force
+        }
+    }
+
+    $taskName = "ResetRDSGracePeriod_$(Get-Random)"
+    $logFile  = Join-Path $env:TEMP "RDSGraceReset.log"
+
+    # Remove old log if exists
+    Remove-Item $logFile -Force -ErrorAction SilentlyContinue
+
+    Write-Host "  Creating scheduled task '$taskName'..." -ForegroundColor Gray
+
+    # Create a scheduled task that runs this same script as SYSTEM
+    $action  = New-ScheduledTaskAction -Execute "powershell.exe" `
+        -Argument "-ExecutionPolicy Bypass -NoProfile -File `"$scriptPath`" *> `"$logFile`""
+    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+
+    Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal `
+        -Settings $settings -Force | Out-Null
+
+    Write-Host "  Starting task as SYSTEM..." -ForegroundColor Gray
+    Start-ScheduledTask -TaskName $taskName
+
+    # Wait for the task to complete (up to 60 seconds)
+    $timeout = 60
+    $elapsed = 0
+    do {
+        Start-Sleep -Seconds 2
+        $elapsed += 2
+        $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+        $taskState = (Get-ScheduledTask -TaskName $taskName).State
+    } while ($taskState -eq "Running" -and $elapsed -lt $timeout)
+
+    # Cleanup the scheduled task
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+
+    # Show the results from the SYSTEM execution
+    Write-Host "`n--- Output from SYSTEM execution ---" -ForegroundColor Cyan
+    if (Test-Path $logFile) {
+        Get-Content $logFile | ForEach-Object { Write-Host $_ }
+        Remove-Item $logFile -Force -ErrorAction SilentlyContinue
+    } else {
+        Write-Host "  (No output log found - task may have failed to start)" -ForegroundColor Red
+    }
+    Write-Host "--- End of SYSTEM output ---`n" -ForegroundColor Cyan
+
+    # Prompt for reboot (from the user's session)
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host "  Script completed." -ForegroundColor Green
+    Write-Host "  A reboot is required for changes to take effect." -ForegroundColor Yellow
+    Write-Host "========================================`n" -ForegroundColor Cyan
+
+    Read-Host "Press Enter to reboot now (or Ctrl+C to cancel)"
+    Restart-Computer -Force
+    exit
+}
+
+# =============================================================================
+# BELOW RUNS AS SYSTEM
+# =============================================================================
+Write-Host "Running as SYSTEM - full privileges available." -ForegroundColor Green
+
+# --- P/Invoke class ---
 $nativeCode = @'
 using System;
 using System.Runtime.InteropServices;
 
 public class NativeRegistry
 {
-    // --- Token privilege APIs ---
     [DllImport("advapi32.dll", SetLastError = true)]
     static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
 
@@ -43,7 +124,6 @@ public class NativeRegistry
     [DllImport("kernel32.dll")]
     static extern void SetLastError(uint dwErrCode);
 
-    // --- Registry APIs ---
     [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Auto)]
     static extern int RegOpenKeyEx(
         IntPtr hKey, string subKey, uint options, uint samDesired, out IntPtr phkResult);
@@ -56,25 +136,15 @@ public class NativeRegistry
         IntPtr handle, uint ObjectType, uint SecurityInfo,
         byte[] psidOwner, byte[] psidGroup, IntPtr pDacl, IntPtr pSacl);
 
-    // --- Constants ---
     const uint TOKEN_ADJUST_PRIVILEGES = 0x0020;
     const uint TOKEN_QUERY = 0x0008;
     const uint SE_PRIVILEGE_ENABLED = 0x00000002;
 
-    // HKEY_LOCAL_MACHINE
     static readonly IntPtr HKLM = new IntPtr(unchecked((int)0x80000002));
 
-    // Registry access rights
-    const uint WRITE_OWNER   = 0x00080000;
-    const uint WRITE_DAC     = 0x00040000;
-    const uint KEY_READ      = 0x20019;
-    const uint KEY_ALL_ACCESS = 0xF003F;
-
-    // SetSecurityInfo constants
-    const uint SE_REGISTRY_KEY   = 4;
+    const uint WRITE_OWNER = 0x00080000;
+    const uint SE_REGISTRY_KEY = 4;
     const uint OWNER_SECURITY_INFORMATION = 0x00000001;
-
-    // --- Methods ---
 
     public static int EnablePrivilege(string privilege)
     {
@@ -100,14 +170,11 @@ public class NativeRegistry
 
     public static int TakeOwnership(string subKeyPath, byte[] ownerSid)
     {
-        // Open the key with WRITE_OWNER access using Win32 API directly.
-        // This bypasses .NET's OpenSubKey which does its own ACL check and fails.
         IntPtr hKey;
         int err = RegOpenKeyEx(HKLM, subKeyPath, 0, WRITE_OWNER, out hKey);
         if (err != 0)
             return err;
 
-        // Set the owner using SetSecurityInfo
         err = SetSecurityInfo(hKey, SE_REGISTRY_KEY, OWNER_SECURITY_INFORMATION,
             ownerSid, null, IntPtr.Zero, IntPtr.Zero);
 
@@ -120,40 +187,25 @@ public class NativeRegistry
 try {
     Add-Type -TypeDefinition $nativeCode -Language CSharp -ErrorAction Stop
 } catch {
-    if ($_.Exception.Message -notlike '*already exists*') {
-        throw
-    }
+    if ($_.Exception.Message -notlike '*already exists*') { throw }
 }
 
-# =============================================
-# Step 1: Enable privileges
-# =============================================
+# Step 1: Enable privileges (SYSTEM always has them)
 Write-Host "Step 1: Enabling privileges..." -ForegroundColor Yellow
 
 $result = [NativeRegistry]::EnablePrivilege("SeTakeOwnershipPrivilege")
 if ($result -ne 0) {
-    Write-Host "FAILED to enable SeTakeOwnershipPrivilege (error: $result)." -ForegroundColor Red
-    Write-Host "  -1=OpenProcessToken -2=LookupPrivilege -3=AdjustToken 1300=NotHeld" -ForegroundColor Gray
-    Read-Host "Press Enter to exit"
+    Write-Host "FAILED SeTakeOwnershipPrivilege (error: $result)." -ForegroundColor Red
     exit 1
 }
 Write-Host "  -> SeTakeOwnershipPrivilege enabled." -ForegroundColor Green
 
-$result2 = [NativeRegistry]::EnablePrivilege("SeRestorePrivilege")
-if ($result2 -eq 0) {
-    Write-Host "  -> SeRestorePrivilege enabled." -ForegroundColor Green
-} else {
-    Write-Host "  -> SeRestorePrivilege skipped (code: $result2), continuing..." -ForegroundColor Yellow
-}
+[NativeRegistry]::EnablePrivilege("SeRestorePrivilege") | Out-Null
+Write-Host "  -> SeRestorePrivilege enabled." -ForegroundColor Green
 
-# =============================================
 # Step 2: Take ownership via Win32 API
-# =============================================
-$regKeyPath = "SYSTEM\CurrentControlSet\Control\Terminal Server\RCM\GracePeriod"
+Write-Host "`nStep 2: Taking ownership of GracePeriod key..." -ForegroundColor Yellow
 
-Write-Host "`nStep 2: Taking ownership of GracePeriod key (Win32 API)..." -ForegroundColor Yellow
-
-# Get the Administrators SID as a byte array
 $adminSid = New-Object System.Security.Principal.SecurityIdentifier(
     [System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null
 )
@@ -163,15 +215,11 @@ $adminSid.GetBinaryForm($sidBytes, 0)
 $err = [NativeRegistry]::TakeOwnership($regKeyPath, $sidBytes)
 if ($err -ne 0) {
     Write-Host "FAILED to take ownership (Win32 error: $err)." -ForegroundColor Red
-    Write-Host "  2 = Key not found, 5 = Access denied" -ForegroundColor Gray
-    Read-Host "Press Enter to exit"
     exit 1
 }
 Write-Host "  -> Ownership set to Administrators." -ForegroundColor Green
 
-# =============================================
-# Step 3: Grant Full Control (now that we own it, .NET works)
-# =============================================
+# Step 3: Grant Full Control
 Write-Host "`nStep 3: Granting Full Control permissions..." -ForegroundColor Yellow
 try {
     $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
@@ -182,7 +230,6 @@ try {
 
     if ($null -eq $key) {
         Write-Host "FAILED: Could not open key for permission change." -ForegroundColor Red
-        Read-Host "Press Enter to exit"
         exit 1
     }
 
@@ -213,20 +260,16 @@ try {
     Write-Host "  -> Full Control granted to Administrators and sadmin." -ForegroundColor Green
 } catch {
     Write-Host "FAILED to set permissions: $($_.Exception.Message)" -ForegroundColor Red
-    Read-Host "Press Enter to exit"
     exit 1
 }
 
-# =============================================
 # Step 4: Delete the TimeBomb value(s)
-# =============================================
 Write-Host "`nStep 4: Deleting TimeBomb value(s)..." -ForegroundColor Yellow
 try {
     $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($regKeyPath, $true)
 
     if ($null -eq $key) {
         Write-Host "FAILED: Could not open key for deletion." -ForegroundColor Red
-        Read-Host "Press Enter to exit"
         exit 1
     }
 
@@ -248,17 +291,9 @@ try {
     $key.Close()
 } catch {
     Write-Host "FAILED to delete TimeBomb: $($_.Exception.Message)" -ForegroundColor Red
-    Read-Host "Press Enter to exit"
     exit 1
 }
 
-# =============================================
-# Step 5: Reboot
-# =============================================
 Write-Host "`n========================================" -ForegroundColor Cyan
-Write-Host "  RDS Grace Period has been reset!" -ForegroundColor Green
-Write-Host "  A reboot is required." -ForegroundColor Yellow
-Write-Host "========================================`n" -ForegroundColor Cyan
-
-Read-Host "Press Enter to reboot now (or Ctrl+C to cancel)"
-Restart-Computer -Force
+Write-Host "  SUCCESS! TimeBomb deleted as SYSTEM." -ForegroundColor Green
+Write-Host "========================================" -ForegroundColor Cyan
