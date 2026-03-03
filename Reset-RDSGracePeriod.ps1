@@ -2,6 +2,7 @@
 # Resets the RDS 120-day grace period by deleting the TimeBomb registry value.
 # Run from an elevated (Administrator) PowerShell prompt:
 #   Set-ExecutionPolicy Bypass -Scope Process -Force
+# Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
 #   .\Reset-RDSGracePeriod.ps1
 
 Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
